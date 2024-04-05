@@ -645,7 +645,7 @@ For small datasets (say <1TB), the default settings of autovacuum generally work
 For large datasets, autovacuum has many parameters that should be tuned for optimal performance.
 A large company that uses postgres (like Instagram) would have multiple employees whose job is basically just tuning autovacuum.
 
-<img src=autovacuum.jpg width=300px >
+<img src=img/autovacuum.jpg width=300px >
 
 <!--
 ```
@@ -662,4 +662,7 @@ root@294274f36cc2:/var/lib/postgresql/data# ls -l base/13481/16425*
 
 ## Submission
 
-Write 1 paragraph into sakai about what you learned from the lab.
+This material is not normally taught in college CS classes because it is difficult to design problem sets that will assess a student's understanding.
+Nevertheless, it is important material that is required for understanding real-world large scale systems.
+Therefore, we're covering the material in class, and you're responsible for this material in the final exam, but there's no "real" submission.
+To submit the lab, just write 1 short paragraph into sakai about what you learned.

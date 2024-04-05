@@ -16,31 +16,17 @@ class Ledger:
     '''
 
     def __init__(self, url):
-        '''
-        The constructor just creates a connection to the database.
-        The same connection is re-used between all SQL commands,
-        and the right way to think about a connection is as a single psql process where those commands will be entered.
-        '''
+        # create the database connection
         self.engine = sqlalchemy.create_engine(url)
         self.connection = self.engine.connect()
 
     def get_all_account_ids(self):
-        '''
-        This function is used inside of the random_transfers.py script.
-        '''
         sql = text('SELECT account_id FROM accounts;')
         logging.debug(sql)
         results = self.connection.execute(sql)
         return [row['account_id'] for row in results.all()]
 
     def create_account(self, name):
-        '''
-        In order to create an account, we need to insert a new row into the "accounts" able and the "balances" table.
-        Because of the FOREIGN KEY constraint on the "balances" table,
-        we need to know the "account_id" column of the row we've inserted into "accounts".
-        This value is generated for us automatically by the database, and not within python.
-        So we need to query the database after inserting into "accounts" to get the value.
-        '''
         with self.connection.begin():
 
             # insert the name into "accounts"
@@ -68,27 +54,50 @@ class Ledger:
             credit_account_id,
             amount
             ):
-        '''
-        This function adds a row to the "transactions" table with the specified input values.
-        It also updates the "balances" table to apply the debits and credits to the appropriate accounts.
-        Notice that in order to do an UPDATE command to apply the credits/debits, we first need to run a SELECT command to get the current balance.
-        '''
+        while True:
+            try:
+                return self._transfer_funds(debit_account_id, credit_account_id, amount)
+            except sqlalchemy.exc.OperationalError as e:
+                #pass
+                logging.debug(str(e).split('\n')[0])
 
-        # insert the transaction
-        sql = f'INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES ({debit_account_id}, {credit_account_id}, {amount})'
-        logging.debug(sql)
-        self.connection.execute(sql)
+    def _transfer_funds(
+            self,
+            debit_account_id,
+            credit_account_id,
+            amount
+            ):
+        with self.connection.begin():
+        #if True:
 
-        # update the debit account balance
-        sql = f'SELECT balance FROM balances WHERE account_id = {debit_account_id}'
-        logging.debug(sql)
-        results = self.connection.execute(sql)
-        debit_account_balance = results.first()['balance']
+            # lock the table
+            '''
+            sql = f'LOCK balances IN ACCESS EXCLUSIVE MODE' # FOR UPDATE'
+            logging.debug(sql)
+            self.connection.execute(sql)
+            '''
 
-        debit_new_balance = debit_account_balance - amount
-        sql = f'UPDATE balances SET balance={debit_new_balance} WHERE account_id = {debit_account_id}'
-        logging.debug(sql)
-        self.connection.execute(sql)
+            # first we get the account balances
+            sql = f'SELECT balance FROM balances WHERE account_id = {debit_account_id} FOR UPDATE'
+            logging.debug(sql)
+            results = self.connection.execute(sql)
+            debit_account_balance = results.first()['balance']
 
-        # FIXME:
-        # you need to update the credit account balance as well
+            sql = f'SELECT balance FROM balances WHERE account_id = {credit_account_id} FOR UPDATE'
+            logging.debug(sql)
+            results = self.connection.execute(sql)
+            credit_account_balance = results.first()['balance']
+
+            # insert the transaction
+            sql = f'INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES ({debit_account_id}, {credit_account_id}, {amount})'
+            logging.debug(sql)
+            self.connection.execute(sql)
+
+            # update the balances
+            sql = f'UPDATE balances SET balance={debit_account_balance - amount} WHERE account_id = {debit_account_id}'
+            logging.debug(sql)
+            self.connection.execute(sql)
+
+            sql = f'UPDATE balances SET balance={credit_account_balance + amount} WHERE account_id = {credit_account_id}'
+            logging.debug(sql)
+            self.connection.execute(sql)

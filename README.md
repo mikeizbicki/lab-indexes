@@ -1,481 +1,665 @@
-# Lab: Transactions
+# Lab: MVCC Implementation Details
 
-In the [consistency lab](https://github.com/mikeizbicki/lab-consistency), you created a simple database for a double-entry accounting system.
-In this lab, we will extend this database to have a simple python library interface.
-You will see:
+This lab will continue our running example of the double entry accounting system we started with the [lab-consistency]() and [lab-transactions]().
+In this lab, you will:
+1. observe how modifying data creates dead tuples,
+2. learn about the HOT tuple update optimization,
+3. learn about the performance impact of VACUUM and VACUUM FULL.
 
-1. that database code that looks "obviously correct" can be horribly flawed,
-2. how to fix these flaws using transactions and locks, and
-3. how using the wrong lock can slow down your code.
+<img src=img/bloat.jpg width=400px />
 
-Because of the difficulty and importance of this topic,
-you should be extra careful in this lab.
+## Problem Setup
 
-<img src=img/pitfalls1.jpg width=300px>
+Open the `docker-compose.yml` file and modify the port of the `pg` service.
+We will only be using one database in this lab.
 
-## Task 0: Project Setup
-
-Clone this repo onto the lambda server.
-There is no need to fork the repository.
-
-### Bringing up the Database
-
-We will use postgres as our database for this lab.
-Try to bring up the database with the command
+Then bring up the database.
 ```
+$ docker-compose build
 $ docker-compose up -d
 ```
-You should get an error about a bad port number.
-
-In previous projects, this never happened because the database port was never exposed to the lamdba server.
-In this project, however, the database needs to be exposed to the lambda server.
-That's because we will be running python code on the lambda server (and not the `pg` container) that needs to connect to the database.
-
-Edit the `ports` field of the `docker-compose.yml` file so that your database will be exposed on a unique port that doesn't conflict with other students.
-(Your UID is a reasonable choice, and you can find it by running `id -u` in the shell.)
-Then re-run
+In order to explore how postgres stores data,
+we will connect to the container using a shell instead of psql.
 ```
-$ docker-compose up -d
+$ docker-compose exec pg bash
 ```
-and ensure that you get no errors.
-Verify that you are able to successfully connect to the database using psql and the command
+The `PGDATA` environment variable contains the path where postgres stores all of its data.
+Enter that path and view the contents.
 ```
-$ psql postgresql://postgres:pass@localhost:<PORT>
+$ cd $PGDATA
+$ pwd
+$ ls
 ```
-where `<PORT>` should be replaced with the port number in your `docker-compose.yml` file.
-Running the command
+[The Internals of Postgres Book, Section 1.2](http://www.interdb.jp/pg/pgsql01/02.html) contains an overview of each of these files.
+You are not responsible for memorizing their purpose, but you are responsible for being able to read through the documentation about these files if necessary.
+
+For us, the most important file is the `base` directory.
+It contains all databases in the postgres cluster, each represented by a directory.
+You should see three folders, although the might be named differently than mine below.
 ```
-postgres=# \d
+$ ls base
+1  13480  13481
 ```
-should list a handful of tables.
-
-> **NOTE:**
-> The `psql` command above is running directly on the lambda server and not inside the container.
-> The long url passed into `psql` tells psql how to connect to the database inside the container.
-> Previously, this we were running psql inside the container using a command like
-> ```
-> $ docker-compose exec pg psql
-> ```
-> This `psql` incantation runs inside the container (because of `docker-compose exec pg`), and so the url is not needed.
-> Both of rhese two commands are essentially equivalent.
-> All of the SQL commands you run from inside `psql` will have the exact same effects no matter how you get inside of `psql`.
-
-### The Schema
-
-The most important file in any project working with databases is the `.sql` file containing the schema.
-This project's schema is stored in `services/pg/sql/ledger-pg.sql`.
-The `Dockerfile` automatically loads this sql file into the database when the database first starts.
-
-Let's take a look at the contents:
+How do we know which of these our data is stored in?
+Start psql.
 ```
-$ cat sql/ledger-pg.sql
-CREATE TABLE accounts (
-    account_id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL
-);
-
-CREATE TABLE transactions (
-    transaction_id SERIAL PRIMARY KEY,
-    debit_account_id INTEGER REFERENCES accounts(account_id),
-    credit_account_id INTEGER REFERENCES accounts(account_id),
-    amount NUMERIC(10,2),
-    CHECK (amount > 0),
-    CHECK (debit_account_id != credit_account_id)
-);
-
-CREATE TABLE balances (
-    account_id INTEGER PRIMARY KEY REFERENCES accounts(account_id),
-    balance NUMERIC(10,2)
-);
+$ psql
 ```
-This file is very similar to the schema from the consistency lab.
-The `accounts` and `transactions` tables are exactly the same.
-Recall that `accounts` just stores the names of all of our accounts,
-and `transactions` stores every transfer of money between two accounts.
-
-The `balances` table is new.
-
-Recall that in the last lab instead of having a `balances` table, we created a `balances` view.
-The view computed the total balance in each account by summing over the `transactions` table.
-It looked like
+Notice that because we are currently inside of the container, there is no need to pass any url to psql to perform the connection.
+Postgres stores information about the databases in the cluster in the `pg_database` relation.
+View it with the following command.
 ```
-CREATE VIEW balances AS
-SELECT
-    account_id,
-    name,
-    coalesce(credits, 0) as credits,
-    coalesce(debits, 0) as debits,
-    coalesce(credits, 0) - coalesce(debits, 0) AS balance
-FROM accounts
-LEFT JOIN (
-    SELECT credit_account_id as account_id, sum(amount) as credits
-    FROM transactions
-    GROUP BY credit_account_id
-) AS credits USING (account_id)
-LEFT JOIN (
-    SELECT debit_account_id as account_id, sum(amount) as debits
-    FROM transactions
-    GROUP BY debit_account_id
-) AS debits USING (account_id)
-ORDER BY account_id
-;
+SELECT oid,datname FROM pg_database;
+  oid  |  datname
+-------+-----------
+ 13481 | postgres
+     1 | template1
+ 13480 | template0
 ```
-It turns out that this view requires $O(n)$ time to compute,
-where $n$ is the total number of transactions in our history.
+The `postgres` docker repo by default has 3 databases in the cluster.
+The `template0` and `template1` databases are used internally,
+and the `postgres` database is what you're currently connected to.
+In postgres, anything that needs to be stored on the hard drive will get an *Object ID* (OID) associated to it,
+and the oid will be the name of that file or folder.
+Thus, all the information for our database can be found in the `$PGDATA/base/13481` folder.
 
-> **ASIDE:**
-> We will see in the comming weeks that this query is implemented using an algorithm called SEQUENTIAL SCAN.
-> This algorithm is basically a for loop over the entire `transactions` table,
-> and that's where the $O(n)$ runtime comes from.
-
-For the small databases we used in the last lab,
-that wasn't a problem.
-But in the real world, this would be a problem.
-Real accounting systems can have trillions of transactions stored in them,
-and so an $O(n)$ operation would be very slow.
-We need something that will take $O(1)$ time.
-
-The `balances` table will let us achieve this faster lookup through *caching*.
-The basic idea is that we should pre-compute the balances as we insert the transactions.
-That is, whenever we insert a new transaction,
-we should also update the corresponding rows in the `balances` table at the same time.
-That way, when we want the balance, all we need to do is look at a single row in the `balances` table instead of summing over the entire `transactions` table.
-
-This type of caching is very widely used in realworld databases.
-In postgres, these cached tables are offten colloquiually referred to as [rollup tables](https://www.citusdata.com/blog/2018/06/14/scalable-incremental-data-aggregation/).
-
-> **NOTE:**
-> This is confusing terminology because there is a [ROLLUP sql command](https://www.educba.com/postgresql-rollup/) that is totally unrelated to the idea of a rollup table.
-> The naming of a rollup table was invented by a group of postgres developers at a data analytics company called citus.
-> Citus is famous company in the postgres world for their efficient large scale postgres products and tutorials,
-> and so their idiosyncratic naming has become standard.
-> [Citus was acquired by Microsoft in 2019](https://blogs.microsoft.com/blog/2019/01/24/microsoft-acquires-citus-data-re-affirming-its-commitment-to-open-source-and-accelerating-azure-postgresql-performance-and-scale/) and their tools now are the backend for many big data projects at Microsoft.
-
-### Adding Accounts (I)
-
-The file `Ledger/__init.py__` contains our library's python code.
-In this section, we'll see how to use this library to manipulate the database.
-
-First, we'll verify there are no accounts in the database.
-Run the following commands
+Leave psql, and run the following command to see the files that make up the `postgres` database
 ```
-$ psql postgresql://postgres:pass@localhost:<PORT>
-postgres=# select * from accounts;
- account_id | name
-------------+------
-(0 rows)
+$ ls base/13481
 ```
-Next, we will open python in interactive mode,
-create a new `Ledger` object,
-and run the `create_account` method on that object.
-```
-$ python3
->>> import Ledger
->>> ledger = Ledger.Ledger('postgresql://postgres:pass@localhost:<PORT>')
->>> ledger.create_account('test')
-2024-03-22 00:09:04.560 - 55670 - INSERT INTO accounts (name) VALUES (:name);
-2024-03-22 00:09:04.565 - 55670 - SELECT account_id FROM accounts WHERE name=:name
-2024-03-22 00:09:04.568 - 55670 - INSERT INTO balances VALUES (:account_id, 0);
-```
-The library is structured so that every time it runs a SQL command, it logs those commands to the screen for you to see.
-You can see the timestamp that the command run, followed by the process id of the command, followed by the actual command.
+You should see a lot of files.
+Each of these files will start with a number, which is the OID of the object that file represents.
 
-> **NOTE:**
-> The `import` command above is likely to give you an error about missing libraries.
-> You will need to use the `pip3 install` command to install these libraries.
-
-Here, we can see that three SQL commands were run by the `create_account` method.
-Open the file `Ledger/__init__.py` and read through the `create_account` method to understand why three SQL statements were run.
-
-Now reconnect to psql and verify that an account has been created.
+Our goal is to be able to measure how much disk space each table in our database takes up,
+and in order to do that, we need to find the OID of each table.
+Go back into psql.
 ```
-$ psql postgresql://postgres:pass@localhost:<PORT>
-postgres=# select * from accounts;
- account_id | name
-------------+------
-          1 | test
+$ psql
+```
+Run `\d` to view all of the relations in the database.
+You should see only 5: 3 tables, and 2 sequences (sequences store information related to the SERIAL type we are using as primary keys in the `accounts` and `transactions` tables).
+Notice that there are many things besides relations that get assigned an OID and take up disk space,
+but we won't care about any of these other objects in this class.
+
+> **Task:**
+> Your first task is to find the OID of each of the three tables in the database.
+> [The Internals of Postgres Book, Section 1.2](http://www.interdb.jp/pg/pgsql01/02.html#123-layout-of-files-associated-with-tables-and-indexes) contains a query that you can use to do this.
+> Make a note of these three OIDs.
+> You'll have to reference them later in the lab.
+
+<!--
+postgres=# SELECT relname, oid, relfilenode FROM pg_class WHERE relname = 'accounts';
+ relname  |  oid  | relfilenode
+----------+-------+-------------
+ accounts | 16386 |       16386
 (1 row)
-```
-### Adding Accounts (II)
 
-We're going to be creating some test cases soon.
-To do that, we'll need an automated way of populating the database with accounts.
-The file `scripts/create_accounts.py` calls the `create_account` method in a for loop to do this for us.
+postgres=# SELECT relname, oid, relfilenode FROM pg_class WHERE relname = 'balances';
+ relname  |  oid  | relfilenode
+----------+-------+-------------
+ balances | 16415 |       16415
+(1 row)
 
-First, reset the database by bringing it down and back up.
-```
-$ docker-compose down
-$ docker-compose up -d
-$ psql postgresql://postgres:pass@localhost:<PORT>
-postgres=# select * from accounts;
- account_id | name
-------------+------
-(0 rows)
-```
-Now run the command
-```
-$ python3 scripts/create_accounts.py postgresql://postgres:pass@localhost:<PORT> 
-```
-You probably get an error message that looks something like
-```
-Traceback (most recent call last):
-  File "scripts/create_accounts.py", line 1, in <module>
-    import Ledger
-ModuleNotFoundError: No module named 'Ledger'
-```
-This is because when python is running a script, it defaults to assuming all `import` commands are loading installed libraries.
-When we were running in interactive mode above, this was not the case, and the `import` command correctly looked in our current folder.
+postgres=# SELECT relname, oid, relfilenode FROM pg_class WHERE relname = 'transactions';
+   relname    |  oid  | relfilenode
+--------------+-------+-------------
+ transactions | 16397 |       16397
+(1 row)
 
-In order to get python to look into our current folder, we need to set the `PYTHONPATH` environment variable with the following command
+postgres=# SELECT pg_relation_filepath('accounts');
+ pg_relation_filepath
+----------------------
+ base/13481/16386
+(1 row)
+
+postgres=# SELECT pg_relation_filepath('balances');
+ pg_relation_filepath
+----------------------
+ base/13481/16415
+(1 row)
+
+postgres=# SELECT pg_relation_filepath('transactions');
+ pg_relation_filepath
+----------------------
+ base/13481/16397
+(1 row)
+-->
+
+## Observing `accounts`
+
+For me, the `accounts` table has OID 16386,
+and so it is stored in the file `$PGDATA/base/13481/16386`.
+Use the `ls -l` command to get the total size of the table.
+```
+ls -l base/13481/16386
+-rw------- 1 postgres postgres 0 Apr  5 06:05 base/13481/16386
+```
+At this point, you should get that it takes up 0 bytes because we haven't inserted anything yet.
+
+Now we'll insert some accounts using the `create_accounts.py` script we introduced in the last lab.
+This script is only available on the lambda server (and not inside the container),
+so you'll have to exit the container.
+
+Recall that in order to use your `Ledger` library in python,
+you have to first set the `EXPORTPATH` environment variable.
+On the lambda server, run
 ```
 $ export PYTHONPATH=.
 ```
-Now, rerun the `create_accounts.py` script.
-You should see a lot of output of `SELECT` and `INSERT` statements.
-
-Connect to psql and run the command
+Then run the following command.
+(You'll have to change the `9999` to whatever port number you specified in the `docker-compose.yml` file.)
 ```
-SELECT count(*) FROM accounts;
+$ time python3 scripts/create_accounts.py postgresql://postgres:pass@localhost:9999 --num_accounts=10000
 ```
-You should see that 1000 accounts have been created.
+This command inserts 10000 new user accounts into the accounts table.
 
-The tasks below will occasionally ask you to reset the database.
-To do so, you'll need to bring it down, then back up, then recreate these accounts.
+> **Note:**
+> I like to use the `time` command to time any command that will take a long time to run.
+> We won't actually need the time for this assignment, but there's no downside to measuring it.
+> My execution took 47 seconds.
 
-## Task 1: Correctness
-
-We saw in the last lab that the database is able to automatically enforce certain types of correctness.
-But there are other types of correctness that no database can check automatically.
-
-In our this project, one of the properties of our `balances` table is that
+Now go back in the container and re-check the size of the `accounts` table.
 ```
-SELECT sum(balance) FROM balances;
+$ ls -l $PGDATA/base/13481/16386*
+-rw------- 1 postgres postgres 524288 Apr  4 22:19 base/13481/16386
+-rw------- 1 postgres postgres  24576 Apr  4 22:18 base/13481/16386_fsm
 ```
-should always be 0.
-Make sure you understand why before continuing.
+Notice that it is non-zero, and that the *free space map* (FSM) file has been created as well.
+Recall that the FSM stores precomputed values of the amount of free space in each page,
+and this file is used by postgres to quickly find a page that it can insert a tuple into.
 
-It is common practice to document these *invariants* that a database should maintain by writing scripts that verify the invariant.
-The script `scripts/integrity_check.sh` verifies that the above invariant is maintained.
-Run it.
+Let's count how many pages are in the table.
+My `16386` file above uses `524288` bytes, and each page is 8kb (i.e. 8192 bytes).
+Based on these values, you can use python to compute the number of pages:
 ```
-$ sh scripts/integrity_check.sh
-sum(balance) = 0.00
-PASS
+$ python3
+>>> 524288/8192
+64.0
 ```
-At this point, we haven't made any transactions.
-All the balances are initialized to 0,
-and so the script passes by default.
+Notice that the filesize is exactly a multiple of 8192.
+This will always be the case for every file.
 
-### The Problem
+## Observing `transactions` and `balances`
 
-Run the command
+The `accounts` table is relatively uninteresting.
+Our test scripts only ever run the INSERT command,
+and so there is no opportunity for dead tuples.
+The `transactions` table also will only have INSERT commands run.
+The `balances` table, however, is more interesting.
+Inside of our `Ledger/__init__.py` file,
+whenever we INSERT to `transactions`, we perform two UPDATEs to `balances`.
+So we should expect to see dead tuples in the `balances` table after runing this script.
+In this section, we will observe these dead tuples and measure their affect on our performance.
+
+Before we insert data, we should check the size of the `balances` and `transactions` tables.
+Recall that to do this, you'll need to enter the container and run `ls -l` on the files that store these tables.
+
+> **Warning:**
+> Don't proceed to the next steps until you've completed this step.
+> You'll be measuring the size of these files quite a bit,
+> and so it's important you know how to do it.
+
+Now leave the container and return to the lambda server.
+
+The `lots_of_data.sh` script will insert 1000,000 transactions into our database,
+and so call 200,000 UPDATE commands on `balances`.
+View the code, and make sure you understand what it's doing.
 ```
-$ python3 scripts/random_transfers.py postgresql://postgres:pass@localhost:<PORT>
+$ cat scripts/lots_of_data.sh
 ```
-You should see a large number of SQL commands scroll through your screen.
-This script performs 1000 random transfers between accounts by calling the `Ledger.transfer_funds` method.
-(I recommend you read through the source and understand it before continuing.)
-
-Unfortunately, the `Ledger.transfer_funds` method is currently incorrect.
-Rerun the integrity check.
+Now run it.
 ```
-$ sh scripts/integrity_check.sh
+$ time sh scripts/lots_of_data.sh postgresql://postgres:pass@localhost:9999
 ```
-You should see that the sum of the balances is non-zero,
-and that the check fails.
-The `random_transfers.py` script is nondeterministic,
-so everyone will have different sums,
-but they should all be non-zero.
+It should take about two minutes to run.
 
-### The Solution
+Once again, view the size of the containers.
+For me, the appropriate commands and outputs looked like:
+```
+$ ls -l $PGDATA/base/13481/16415*
+-rw------- 1 postgres postgres 1220608 Apr  4 22:29 base/13481/16415
+-rw------- 1 postgres postgres   24576 Apr  4 22:29 base/13481/16415_fsm
+$ ls -l $PGDATA/base/13481/16397*
+-rw------- 1 postgres postgres 52682752 Apr  4 22:27 base/13481/16397
+-rw------- 1 postgres postgres    32768 Apr  4 22:27 base/13481/16397_fsm
+```
+And the `balances` table (OID 16415) had 1220608/8192=149 pages.
+<!--
+You should make a note of how many pages your `balances` table has,
+as this will be important later.
+-->
 
-Modify the `transfer_funds` method so that it is correct.
+To measure the number of dead tuples, connect to psql and run the following command.
+```
+SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
+```
+Which should give output similar to
+```
+ n_live_tup | n_dead_tup |   relname
+------------+------------+--------------
+      10000 |      14149 | balances
+    1000000 |          0 | transactions
+      10000 |          0 | accounts
+```
+The following things should make sense to you:
+1. The number of live tuples in the `balances` and `accounts` tables is each 10000,
+    which is the number of accounts that we inserted with the `create_accounts.py` command.
+    (We INSERT one row into `balances` for each INSERT into `account`.)
+1. The `transactions` table has 1e6 rows because that's the number of transactions that we inserted.
+1. The `transactions` and `accounts` tables each have 0 dead tuples, because we have never called a DELETE or UPDATE on these tables.
 
-To test your solution, run the following commands to reset the database and then rerun the test scripts.
+But the number of dead tuples in `balances` should look weird to you.
+That's because:
+1. We call two UPDATEs on `balances` for every insert into `transactions`.
+1. For every UPDATE, we create 1 dead tuple according to the procedure outlined at <http://www.interdb.jp/pg/pgsql05/03.html#533-update>.
+1. Therefore we should have 2e6 dead tuples, but we have a number much smaller.
+    (I got 14149, but your number is likely to be different.)
+
+Why is that?
+
+The answer is an optimization postgres implements called a *heap only tuple* (HOT) tuple.
+For our purposes right now, there are two important things to know about the HOT tuple optimization:
+1. It performs a "mini vacuum" that deletes all dead tuples in a page after an UPDATE operation finishes.
+    This mini vacuum is what is deleting most of the dead tuples we "should" be observing.
+    The `pg_stat_user_tables` relation that we examined above also has a column `n_tup_hot_upd` that records how many times the HOT tuple optimization triggered,
+    and if you run the following command:
+    ```
+    SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables;
+    ```
+    you should see that it triggered a lot.
+1. The HOT tuple optimization is only available on columns that do not have indexes.
+    In the next section, you will rerun these commands after creating an index and observe how the index can hurt UPDATE performance by removing the HOT optimization.
+
+> **Note:**
+> HOT tuples are described in detail in [Chapter 7 of our textbook](http://www.interdb.jp/pg/pgsql07.html).
+> For the final exam, you are responsible for understanding how HOT tuples work in detail, but we will not be going over them in lecture.
+
+<!--
+```
+postgres=# CREATE EXTENSION pgstattuple;
+CREATE EXTENSION
+postgres=# \x
+postgres=# SELECT * FROM pgstattuple('transactions');
+-[ RECORD 1 ]------+---------
+table_len          | 52682752
+tuple_count        | 1000000
+tuple_len          | 41000000
+tuple_percent      | 77.82
+dead_tuple_count   | 0
+dead_tuple_len     | 0
+dead_tuple_percent | 0
+free_space         | 388388
+free_percent       | 0.74
+postgres=# SELECT * FROM pgstattuple('accounts');
+-[ RECORD 1 ]------+-------
+table_len          | 524288
+tuple_count        | 10000
+tuple_len          | 460000
+tuple_percent      | 87.74
+dead_tuple_count   | 0
+dead_tuple_len     | 0
+dead_tuple_percent | 0
+free_space         | 2496
+free_percent       | 0.48
+postgres=# SELECT * FROM pgstattuple('balances');
+-[ RECORD 1 ]------+--------
+table_len          | 1253376
+tuple_count        | 10000
+tuple_len          | 334804
+tuple_percent      | 26.71
+dead_tuple_count   | 3927
+dead_tuple_len     | 131463
+dead_tuple_percent | 10.49
+free_space         | 531044
+free_percent       | 42.37
+```
+See: <https://stackoverflow.com/questions/51156552/are-dead-rows-removed-by-anything-else-than-vacuum>
+-->
+
+Let's remove the (relative few) dead tuples using the VACUUM command:
+```
+postgres=# VACUUM balances;
+```
+And then observe that there are now no dead tuples.
+```
+postgres=# SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
+```
+Which should give output similar to
+```
+ n_live_tup | n_dead_tup |   relname
+------------+------------+--------------
+      10000 |          0 | balances
+    1000000 |          0 | transactions
+      10000 |          0 | accounts
+```
+
+<!--
+```
+$ ls -l base/13481/16415*
+-rw------- 1 postgres postgres 1253376 Apr  4 22:52 base/13481/16415
+-rw------- 1 postgres postgres   24576 Apr  4 22:52 base/13481/16415_fsm
+-rw------- 1 postgres postgres    8192 Apr  4 22:52 base/13481/16415_vm
+```
+
+```
+postgres=# SELECT pg_relation_filepath('balances');
+ pg_relation_filepath 
+----------------------
+ base/13481/16415
+(1 row)
+
+postgres=# VACUUM FULL balances;
+VACUUM
+
+postgres=# SELECT * FROM pgstattuple('balances');
+-[ RECORD 1 ]------+-------
+table_len          | 450560
+tuple_count        | 10000
+tuple_len          | 334804
+tuple_percent      | 74.31
+dead_tuple_count   | 0
+dead_tuple_len     | 0
+dead_tuple_percent | 0
+free_space         | 9020
+free_percent       | 2
+
+postgres=# SELECT pg_relation_filepath('balances');
+ pg_relation_filepath 
+----------------------
+ base/13481/16435
+(1 row)
+
+```
+
+```
+$ ls -l base/13481/16415*
+ls: cannot access 'base/13481/16415*': No such file or directory
+$ ls -l base/13481/16435*
+-rw------- 1 postgres postgres 450560 Apr  4 22:56 base/13481/16435
+```
+
+Talk about durability here.
+-->
+
+## Observing `accounts` with an index
+
+We will now repeat the steps above on a table that has an index,
+and see how that index drastically changes performance.
+
+First restart postgres.
 ```
 $ docker-compose down
 $ docker-compose up -d
-$ python3 scripts/create_accounts.py postgresql://postgres:pass@localhost:<PORT> 
-$ python3 scripts/random_transfers.py postgresql://postgres:pass@localhost:<PORT>
-$ sh scripts/integrity_check.sh
 ```
-You won't be able to complete the next task until these checks pass.
-
-## Task 2: Correctness (With Failing Processes)
-
-[Chaos monkey](https://netflix.github.io/chaosmonkey/) is a famous netflix tool for testing robust systems.
-
-<img src=img/chaosmonkey.png />
-
-Chaos monkey works by randomly killing running processes,
-and then checking to see if there was any data corruption.
-We will will use our own "mini chaos monkey" in this lab to test the robustness of the code you wrote for the previous task.
-
-### The Problem
-
-Run the command
+Then enter psql and create an index on `balances(balance)`.
 ```
-$ sh scripts/chaosmonkey_sequential.sh postgresql://postgres:pass@localhost:<PORT> 
+$ docker-compose exec pg psql
+postgres=# CREATE INDEX ON balances(balance);
+CREATE INDEX
 ```
-This file runs the `scripts/random_transactions.py` file in a loop,
-but kills each process after only 1 second.
-(I recommend you read through the source and understand it before continuing.)
-
-The database will now likely once again fail the integrity check.
+Now, all of our steps will be the same as above.
+Add the data.
 ```
-$ sh scripts/integrity_check.sh
-```
-This is because your `transfer_funds` method is not atomic.
-If the python process is killed while it is the middle of this function,
-then only some of the UPDATE/INSERT commands will take effect and not others.
-
-### The Solution
-
-To make your code atomic, you need to wrap it in a transaction.
-
-Using the SQLAlchemy library, we don't directly call the `BEGIN` and `COMMIT` SQL commands.
-Instead, we use the `connection.begin()` method to create a transaction.
-This is commonly done inside of a `with` block so that the transaction is automatically committed when the block closes.
-The code will look something like
-```
-with self.connection.begin():
-    # insert SQL commands here
-```
-The provided `create_account` method is atomic,
-and you can reference this function as an example.
-
-Once you've fixed the `transfer_funds` method,
-rerun the test script to verify that the integrity check is now maintained.
-```
-$ docker-compose down
-$ docker-compose up -d
-$ python3 scripts/create_accounts.py postgresql://postgres:pass@localhost:<PORT> 
-$ sh scripts/chaosmonkey_sequential.sh postgresql://postgres:pass@localhost:<PORT> 
-$ sh scripts/integrity_check.sh
+$ time python3 scripts/create_accounts.py --num_accounts=10000 postgresql://postgres:pass@localhost:9999
+$ time sh scripts/lots_of_data.sh postgresql://postgres:pass@localhost:9999
 ```
 
-Like before, you won't be able to complete the next task until these checks pass.
-
-## Task 3: Correctness (With Concurrency)
-
-Transactions prevent certain types of data corruption, but not all types of data corruption.
-In this section, we will introduce a parallel version of the chaos monkey script.
-We'll see that your corrected code you wrote above will still corrupt the database when run concurrently,
-and we'll need a lock to fix the problem.
-
-### The Problem
-
-Run the command
+<!--
 ```
-$ sh scripts/chaosmonkey_parallel.sh postgresql://postgres:pass@localhost:<PORT> 
+postgres=# select max(balance) from balances;
+   max
+----------
+ 29520.00
+(1 row)
+
+Time: 0.636 ms
+postgres=# explain (analyze, buffers) select max(balance) from balances;
+                                                                              QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=0.49..0.50 rows=1 width=32) (actual time=0.081..0.084 rows=1 loops=1)
+   Buffers: shared hit=4
+   InitPlan 1 (returns $0)
+     ->  Limit  (cost=0.43..0.49 rows=1 width=16) (actual time=0.072..0.074 rows=1 loops=1)
+           Buffers: shared hit=4
+           ->  Index Only Scan Backward using balances_balance_idx on balances  (cost=0.43..77028.09 rows=1176438 width=16) (actual time=0.070..0.070 rows=1 loops=1)
+                 Index Cond: (balance IS NOT NULL)
+                 Heap Fetches: 1
+                 Buffers: shared hit=4
+ Planning Time: 0.187 ms
+ Execution Time: 0.123 ms
+(11 rows)
+
+Time: 0.817 ms
 ```
-This file runs many instances of the `scripts/random_transactions.py` file concurrently.
-Then after waiting 10 seconds, it kills all of the running processes.
-(I recommend you read through the source and understand it before continuing.)
+-->
 
-The database will now likely once again fail the integrity check.
+And check the sizes of the `balances` table.
 ```
-$ sh scripts/integrity_check.sh
+$ ls -l base/13481/16415*
+-rw------- 1 postgres postgres 57540608 Apr  4 23:15 base/13481/16415
+-rw------- 1 postgres postgres    32768 Apr  4 23:15 base/13481/16415_fsm
 ```
-This is because multiple transactions are all editing the `balances` table at the same time.
-You should ensure that you understand how the SELECT and UPDATE commands can be interwoven to cause data loss before moving on.
+(Again, due to the nondeterminism of the `lots_of_data.sh` script, your numbers may be slightly different.)
 
-<!-- FIXME: better explanation -->
+Notice that the size of the `balances` table is about 50x bigger.
+(It's easy to lose track of the fact that we've added an extra order of magnitude.)
 
-### The Solution
-
-At the top of your `transfer_funds` method,
-add a SQL command that locks the `balances` table in ACCESS EXCLUSIVE MODE.
-This will ensure that only one process is able to write to the table at a time.
-
-Once you've made the necessary changes,
-verify they work by rerunning the `chaosmonkey_parallel.sh` script and then verifying the integrity check.
-
-### Performance
-
-To measure the performance of our application, we can measure the total number of transactions that were inserted in the 10 seconds of the chaos monkey script.
-Run the SQL command
+Indexes have their own separate OIDs in postgres,
+and are stored in their own files.
+Therefore the 50x size explosion above doesn't measure the actual size of the index.
+To check its size, first find it's file location:
 ```
-SELECT count(*) FROM transactions
+postgres=# SELECT pg_relation_filepath('balances_balance_idx');
+ pg_relation_filepath
+----------------------
+ base/13481/16425
 ```
-Make a note of the result so you can compare it to the result in the next section.
-My solution got a result around 1500.
-
-## Task 4: More Speed
-
-Finally, our code is correct!
-But unfortunately, it's slow.
-We will now see how to speed it up.
-
-### The Problem
-
-The ACCESS EXCLUSIVE lock ensures that only one process can access the `balances` table at a time.
-This causes two types of problems.
-
-The first is related to "realtime" systems,
-where the database is being updated in realtime by real users.
-As an example, imagine if a credit card company like Visa or Mastercard implemented their accounts ledger this way with an ACCESS EXCLUSIVE lock.
-Then only one person in the world would be able to use a credit card at a time.
-That's obviously not good from a business perspective.
-
-The second problem is related to data warehousing.
-Imagine we have a large dataset (like the Twitter dataset) that we want to load into a database.
-We would like to do this in parallel with many processes to speed up the insertion.
-But if we use ACCESS EXCLUSIVE locks to guarantee correctness,
-then only one process can run at a time,
-and we can't get any parallel speedup.
-
-### The Solution
-
-The ACCESS EXCLUSIVE lock is a table-level lock and is too restrictive for our purposes.
-A row-level lock would ensure that two transactions don't overwrite the balance of a single user,
-while still allowing two transactions to write to two different users.
-
-The SELECT/UPDATE pattern in the `transfer_funds` method is an extremely common pattern in database applications.
-(And, as we've seen, an extremely common source of very subtle bugs!)
-Postgres has a special SELECT FOR UPDATE syntax that simplifies this pattern.
-
-To use the row level lock:
-1. Comment out the LOCK statement that you added in the previous task.
-2. Modify the SELECT statements to use the FOR UPDATE clause.
-
-    The FOR UPDATE clause is added to the end of SELECT statements,
-    so the overall commands will have the form
-    ```
-    SELECT columns FROM table WHERE condition FOR UPDATE
-    ```
-
-Once you've made the necessary changes,
-verify they work by rerunning the `chaosmonkey_parallel.sh` script and then verifying the integrity check.
-
-> **NOTE:**
-> When you run the `chaosmonkey_parallel.sh` script, you will likely notice a large number of deadlock errors being reported.
-> You will need to fix these errors by wrapping the function in a try/except block,
-> and repeating the failed `transfer_funds` function call.
-
-### Verifying Speed Boost
-
-Now let's verify that we are in fact inserting more transactions with the FOR UPDATE version of the code.
-Run the SQL command
+Then measure the size of that file
 ```
-SELECT count(*) FROM transactions
+$ ls -l $PGDATA/base/13481/16425*
+-rw------- 1 postgres postgres 59187200 Apr  4 23:17 base/13481/16425
 ```
-to count the total number of transactions inserted with your improved FOR UPDATE code.
-You should get a number significantly larger than you got in the previous task.
-I get around 20000, a bit more than a 10x increase.
+That's 59MB.
+In total, creating this index caused a table that was previously taking only about 1MB of disk space to now take up 116MB (57 for the table itself, and 59 for the index).
+Disk space is cheap, and so for most problems a 100x explosion in filesize is not a problem.
+But for very large datasets, this could be disasterous.
 
-## Takeaway
+Let's now observer why the filesize is so bloated.
+Rerun our command to measure the number of dead tuples:
+```
+postgres=# SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
+ n_live_tup | n_dead_tup |   relname
+------------+------------+--------------
+      10000 |    2000000 | balances
+    1000000 |          0 | transactions
+      10000 |          0 | accounts
+```
+We are now getting the predicted 2e6 dead tuples in the `balances` table because the HOT tuple optimization cannot fire, and so no mini-vacuum ever cleans the table.
 
-Inserting data into databases correctly is hard.
-There many subtle ways to get code that looks correct,
-but generates incorrect results in the presence of crashes or concurrency.
-Transactions and locks are our only tools to solve these problems.
-But they are hard to use too :(
+Let's run the VACUUM manually.
+```
+postgres=# VACUUM balances;
+VACUUM
+```
+And now observe there are no dead tutples.
+```
+postgres=# SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
+ n_live_tup | n_dead_tup |   relname
+------------+------------+--------------
+      10000 |          0 | balances
+    1000000 |          0 | transactions
+      10000 |          0 | accounts
+(3 rows)
+```
+Leave psql, and use the `ls -l` commands to measure the file size of the table and index.
+```
+$ ls -l base/13481/16415*
+-rw------- 1 postgres postgres 57540608 Apr  5 04:41 base/13481/16415
+-rw------- 1 postgres postgres    32768 Apr  5 04:33 base/13481/16415_fsm
+-rw------- 1 postgres postgres     8192 Apr  5 04:41 base/13481/16415_vm
+$ ls -l base/13481/16425*
+-rw------- 1 postgres postgres 59187200 Apr  5 04:41 base/13481/16425
+```
+Notice that the filesizes have not changed at all.
+Recall that VACUUMing never deletes pages, and so doesn't free up disk space.
+To actually free up disk space, we need to run
+```
+postgres=# VACUUM FULL balances;
+```
+Notice that this command actually changes where the tables are stored on the harddrive.
+If you try to measure the filesize using the old file paths
+```
+$ ls -l base/13481/16415*
+$ ls -l base/13481/16425*
+```
+you will get errors about the file not existing.
 
-Writing scripts that test the integrity of your data is one of the few useful tools we have for debugging these types of problems.
-Whenever you have a dataset that is supposed to maintain some sort of invariant,
-you should always write a script that tests that invariant.
+You should first find the new paths to the files
+```
+postgres=# SELECT pg_relation_filepath('balances');
+ pg_relation_filepath
+----------------------
+ base/13481/16426
+(1 row
+postgres=# SELECT pg_relation_filepath('balances_balance_idx');
+ pg_relation_filepath
+----------------------
+ base/13481/16430
+(1 row)
+```
+Then measure the size of those paths
+```
+root@7e1014af3511:/var/lib/postgresql/data# ls -l base/13481/16426*
+-rw------- 1 postgres postgres 450560 Apr  5 04:43 base/13481/16426
+root@7e1014af3511:/var/lib/postgresql/data# ls -l base/13481/16430*
+-rw------- 1 postgres postgres 245760 Apr  5 04:43 base/13481/16430
+```
+After performing the VACUUM FULL, we've reduced the filesize from over 100MB to under 1MB!
+
+The disadvantage of a VACUUM FULL is that it acquires an EXCLUSIVE LOCK on the table,
+and so nothing can run concurrently.
+
+### Measuring the benefit of the index
+
+If the index causes so much table bloat,
+why do we want it?
+
+Let's say we need to find the largest account balance.
+We can answer that question with a query that looks like
+```
+SELECT max(balance) FROM balances;
+```
+Without an index, this would require a full sequential scan of the table.
+Previously, we saw that the table without an index used 149 pages of disk space,
+and so we would have to read all of those pages.
+As more information gets added to the table, this number would grow linearly.
+
+With an index, however, we will use significantly fewer page accesses.
+
+In class, we saw how to use the EXPLAIN command to compute the *query plan*.
+This is the imperative algorithm that postgres will use to actually compute the query's results. 
+There are many variations of the EXPLAIN command,
+but one useful variation is `EXPLAIN(analyze,buffers)`.
+In this variation, postgres will actually run the command, and report runtimes of each substep and the total number of pages accessed.
+Run the following example in psql to measure the performance of our SELECT query above.
+```
+postgres=# EXPLAIN(analyze, buffers) SELECT max(balance) FROM balances;
+                                                                           QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=0.34..0.35 rows=1 width=32) (actual time=0.051..0.053 rows=1 loops=1)
+   Buffers: shared hit=3
+   InitPlan 1 (returns $0)
+     ->  Limit  (cost=0.29..0.34 rows=1 width=16) (actual time=0.044..0.045 rows=1 loops=1)
+           Buffers: shared hit=3
+           ->  Index Only Scan Backward using balances_balance_idx on balances  (cost=0.29..514.41 rows=9950 width=16) (actual time=0.041..0.042 rows=1 loops=1)
+                 Index Cond: (balance IS NOT NULL)
+                 Heap Fetches: 1
+                 Buffers: shared hit=3
+ Planning Time: 0.176 ms
+ Execution Time: 0.092 ms
+(11 rows)
+```
+THe most import line in the above output is line 2, which reads
+```
+   Buffers: shared hit=3
+```
+Here, "Buffers" is a synonymn for "blocks" or "pages",
+and so we were able to answer the `max` query by accessing only 3 pages instead of the full 149.
+
+This number grows only logrithmically, and so will always be very small.
+I've personally never seen a btree index query access more than 5 pages,
+even on tables that occupy terabytes (and so have billions of pages).
+
+## Autovacuum
+
+So far we've seen:
+1. Indexes are important for speeding up SELECT queries.
+1. But indexes disable the HOT tuple optimization.
+1. This can cause our table to have too many dead tuples.
+1. Dead tuples lead to wasted disk space (and lots of other problems).
+The autovacuum will help us minimize these drawbacks of indexes.
+
+Examine the contents of the schema.
+```
+$ cat services/pg/sql/ledger-pg.sql
+```
+Notice that each of the CREATE TABLE commands is terminated with a clause that looks like
+```
+WITH (autovacuum_enabled = off)
+```
+So all of the databases you've previously been working with had the autovacuum tool disabled.
+(By default, it is enabled for every table.)
+
+Re-enable the autovacuum command by deleting these clauses from each CREATE TABLE command.
+Then bring the database down, rebuild the database, and bring it back up.
+It is important to remember to run the `docker-compose build` command---which you don't normally have to run---because you've changed the schema files.
+If you don't rerun this command, then autovacuum will not be enabled on your new database.
+
+Now create an index in this new database
+```
+$ docker-compose exec pg psql
+postgres=# CREATE INDEX ON balances(balance);
+CREATE INDEX
+```
+And add the data.
+```
+$ time python3 scripts/create_accounts.py --num_accounts=10000 postgresql://postgres:pass@localhost:9999
+$ time sh scripts/lots_of_data.sh postgresql://postgres:pass@localhost:9999
+```
+Once the data is loaded, observe that there are now no dead tuples in your table.
+```
+postgres=# SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
+ n_live_tup | n_dead_tup |   relname
+------------+------------+--------------
+      10000 |          0 | balances
+    1000000 |          0 | transactions
+      10000 |          0 | accounts
+```
+The HOT optimization is not firing (and performing the corresponding mini vacuums).
+But there are no dead tuples in your table.
+That's because autovacuum automatically calls the VACUUM command when the table becomes too bloated.
+Because the VACUUM command acquires only a SHARE UPDATE EXCLUSIVE lock,
+it will not conflict with any concurrent SELECT/UPDATE/INSERT/DELETE commands.
+
+For small datasets (say <1TB), the default settings of autovacuum generally work well.
+For large datasets, autovacuum has many parameters that should be tuned for optimal performance.
+A large company that uses postgres (like Instagram) would have multiple employees whose job is basically just tuning autovacuum.
+
+<img src=autovacuum.jpg width=300px >
+
+<!--
+```
+root@294274f36cc2:/# cd $PGDATA
+root@294274f36cc2:/var/lib/postgresql/data# ls -l base/13481/16415*
+-rw------- 1 postgres postgres 30015488 Apr  5 05:35 base/13481/16415
+-rw------- 1 postgres postgres    24576 Apr  5 05:34 base/13481/16415_fsm
+-rw------- 1 postgres postgres     8192 Apr  5 05:34 base/13481/16415_vm
+root@294274f36cc2:/var/lib/postgresql/data# ls -l base/13481/16425*
+-rw------- 1 postgres postgres 33226752 Apr  5 05:36 base/13481/16425
+-rw------- 1 postgres postgres    24576 Apr  5 05:34 base/13481/16425_fsm
+```
+-->
 
 ## Submission
 
-Upload your modified `__init__.py` file to sakai.
+Write 1 paragraph into sakai about what you learned from the lab.

@@ -579,14 +579,14 @@ postgres=# EXPLAIN(analyze, buffers) SELECT max(balance) FROM balances;
  Execution Time: 0.092 ms
 (11 rows)
 ```
-THe most import line in the above output is line 2, which reads
+The most import line in the above output is line 2, which reads
 ```
    Buffers: shared hit=3
 ```
-Here, "Buffers" is a synonymn for "blocks" or "pages",
+Here, "Buffers" is a synonym for "blocks" or "pages",
 and so we were able to answer the `max` query by accessing only 3 pages instead of the full 149.
 
-This number grows only logrithmically, and so will always be very small.
+This number grows only logarithmically, and so will always be very small.
 I've personally never seen a btree index query access more than 5 pages,
 even on tables that occupy terabytes (and so have billions of pages).
 

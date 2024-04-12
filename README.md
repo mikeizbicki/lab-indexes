@@ -1,668 +1,188 @@
-# Lab: MVCC Implementation Details
+# Lab: Indexes
 
-This lab will continue our running example of the double entry accounting system we started with the [lab-consistency]() and [lab-transactions]().
+This lab will continue our running example of the double entry accounting system.
 In this lab, you will:
-1. observe how modifying data creates dead tuples,
-2. learn about the HOT tuple update optimization,
-3. learn about the performance impact of VACUUM and VACUUM FULL.
+1. learn more edge cases about when indexes can speed up queries, and
+1. get practice using the EXPLAIN command to debug performance problems.
 
-<img src=img/bloat.jpg width=400px />
+<img src=img/explain-analyze.jpg width=300px />
 
 ## Problem Setup
 
-Open the `docker-compose.yml` file and modify the port of the `pg` service.
-We will only be using one database in this lab.
+Clone the repo and bring up the containers.
 
-Then bring up the database.
+The data is stored in TSV (tab separated value) files inside the `data` folder.
+Load it into postgres with the following incantation.
 ```
-$ docker-compose build
-$ docker-compose up -d
-```
-In order to explore how postgres stores data,
-we will connect to the container using a shell instead of psql.
-```
-$ docker-compose exec pg bash
-```
-The `PGDATA` environment variable contains the path where postgres stores all of its data.
-Enter that path and view the contents.
-```
-$ cd $PGDATA
-$ pwd
-$ ls
-```
-[The Internals of Postgres Book, Section 1.2](http://www.interdb.jp/pg/pgsql01/02.html) contains an overview of each of these files.
-You are not responsible for memorizing their purpose, but you are responsible for being able to read through the documentation about these files if necessary.
-
-For us, the most important file is the `base` directory.
-It contains all databases in the postgres cluster, each represented by a directory.
-You should see three folders, although the might be named differently than mine below.
-```
-$ ls base
-1  13480  13481
-```
-How do we know which of these our data is stored in?
-Start psql.
-```
-$ psql
-```
-Notice that because we are currently inside of the container, there is no need to pass any url to psql to perform the connection.
-Postgres stores information about the databases in the cluster in the `pg_database` relation.
-View it with the following command.
-```
-SELECT oid,datname FROM pg_database;
-  oid  |  datname
--------+-----------
- 13481 | postgres
-     1 | template1
- 13480 | template0
-```
-The `postgres` docker repo by default has 3 databases in the cluster.
-The `template0` and `template1` databases are used internally,
-and the `postgres` database is what you're currently connected to.
-In postgres, anything that needs to be stored on the hard drive will get an *Object ID* (OID) associated to it,
-and the oid will be the name of that file or folder.
-Thus, all the information for our database can be found in the `$PGDATA/base/13481` folder.
-
-Leave psql, and run the following command to see the files that make up the `postgres` database
-```
-$ ls base/13481
-```
-You should see a lot of files.
-Each of these files will start with a number, which is the OID of the object that file represents.
-
-Our goal is to be able to measure how much disk space each table in our database takes up,
-and in order to do that, we need to find the OID of each table.
-Go back into psql.
-```
-$ psql
-```
-Run `\d` to view all of the relations in the database.
-You should see only 5: 3 tables, and 2 sequences (sequences store information related to the SERIAL type we are using as primary keys in the `accounts` and `transactions` tables).
-Notice that there are many things besides relations that get assigned an OID and take up disk space,
-but we won't care about any of these other objects in this class.
-
-> **Task:**
-> Your first task is to find the OID of each of the three tables in the database.
-> [The Internals of Postgres Book, Section 1.2](http://www.interdb.jp/pg/pgsql01/02.html#123-layout-of-files-associated-with-tables-and-indexes) contains a query that you can use to do this.
-> Make a note of these three OIDs.
-> You'll have to reference them later in the lab.
-
-<!--
-postgres=# SELECT relname, oid, relfilenode FROM pg_class WHERE relname = 'accounts';
- relname  |  oid  | relfilenode
-----------+-------+-------------
- accounts | 16386 |       16386
-(1 row)
-
-postgres=# SELECT relname, oid, relfilenode FROM pg_class WHERE relname = 'balances';
- relname  |  oid  | relfilenode
-----------+-------+-------------
- balances | 16415 |       16415
-(1 row)
-
-postgres=# SELECT relname, oid, relfilenode FROM pg_class WHERE relname = 'transactions';
-   relname    |  oid  | relfilenode
---------------+-------+-------------
- transactions | 16397 |       16397
-(1 row)
-
-postgres=# SELECT pg_relation_filepath('accounts');
- pg_relation_filepath
-----------------------
- base/13481/16386
-(1 row)
-
-postgres=# SELECT pg_relation_filepath('balances');
- pg_relation_filepath
-----------------------
- base/13481/16415
-(1 row)
-
-postgres=# SELECT pg_relation_filepath('transactions');
- pg_relation_filepath
-----------------------
- base/13481/16397
-(1 row)
--->
-
-## Observing `accounts`
-
-For me, the `accounts` table has OID 16386,
-and so it is stored in the file `$PGDATA/base/13481/16386`.
-Use the `ls -l` command to get the total size of the table.
-```
-ls -l base/13481/16386
--rw------- 1 postgres postgres 0 Apr  5 06:05 base/13481/16386
-```
-At this point, you should get that it takes up 0 bytes because we haven't inserted anything yet.
-
-Now we'll insert some accounts using the `create_accounts.py` script we introduced in the last lab.
-This script is only available on the lambda server (and not inside the container),
-so you'll have to exit the container.
-
-Recall that in order to use your `Ledger` library in python,
-you have to first set the `EXPORTPATH` environment variable.
-On the lambda server, run
-```
-$ export PYTHONPATH=.
-```
-Then run the following command.
-(You'll have to change the `9999` to whatever port number you specified in the `docker-compose.yml` file.)
-```
-$ time python3 scripts/create_accounts.py postgresql://postgres:pass@localhost:9999 --num_accounts=10000
-```
-This command inserts 10000 new user accounts into the accounts table.
-
-> **Note:**
-> I like to use the `time` command to time any command that will take a long time to run.
-> We won't actually need the time for this assignment, but there's no downside to measuring it.
-> My execution took 47 seconds.
-
-Now go back in the container and re-check the size of the `accounts` table.
-```
-$ ls -l $PGDATA/base/13481/16386*
--rw------- 1 postgres postgres 524288 Apr  4 22:19 base/13481/16386
--rw------- 1 postgres postgres  24576 Apr  4 22:18 base/13481/16386_fsm
-```
-Notice that it is non-zero, and that the *free space map* (FSM) file has been created as well.
-Recall that the FSM stores precomputed values of the amount of free space in each page,
-and this file is used by postgres to quickly find a page that it can insert a tuple into.
-
-Let's count how many pages are in the table.
-My `16386` file above uses `524288` bytes, and each page is 8kb (i.e. 8192 bytes).
-Based on these values, you can use python to compute the number of pages:
-```
-$ python3
->>> 524288/8192
-64.0
-```
-Notice that the filesize is exactly a multiple of 8192.
-This will always be the case for every file.
-
-## Observing `transactions` and `balances`
-
-The `accounts` table is relatively uninteresting.
-Our test scripts only ever run the INSERT command,
-and so there is no opportunity for dead tuples.
-The `transactions` table also will only have INSERT commands run.
-The `balances` table, however, is more interesting.
-Inside of our `Ledger/__init__.py` file,
-whenever we INSERT to `transactions`, we perform two UPDATEs to `balances`.
-So we should expect to see dead tuples in the `balances` table after runing this script.
-In this section, we will observe these dead tuples and measure their affect on our performance.
-
-Before we insert data, we should check the size of the `balances` and `transactions` tables.
-Recall that to do this, you'll need to enter the container and run `ls -l` on the files that store these tables.
-
-> **Warning:**
-> Don't proceed to the next steps until you've completed this step.
-> You'll be measuring the size of these files quite a bit,
-> and so it's important you know how to do it.
-
-Now leave the container and return to the lambda server.
-
-The `lots_of_data.sh` script will insert 1000,000 transactions into our database,
-and so call 200,000 UPDATE commands on `balances`.
-View the code, and make sure you understand what it's doing.
-```
-$ cat scripts/lots_of_data.sh
-```
-Now run it.
-```
-$ time sh scripts/lots_of_data.sh postgresql://postgres:pass@localhost:9999
-```
-It should take about two minutes to run.
-
-Once again, view the size of the containers.
-For me, the appropriate commands and outputs looked like:
-```
-$ ls -l $PGDATA/base/13481/16415*
--rw------- 1 postgres postgres 1220608 Apr  4 22:29 base/13481/16415
--rw------- 1 postgres postgres   24576 Apr  4 22:29 base/13481/16415_fsm
-$ ls -l $PGDATA/base/13481/16397*
--rw------- 1 postgres postgres 52682752 Apr  4 22:27 base/13481/16397
--rw------- 1 postgres postgres    32768 Apr  4 22:27 base/13481/16397_fsm
-```
-And the `balances` table (OID 16415) had 1220608/8192=149 pages.
-<!--
-You should make a note of how many pages your `balances` table has,
-as this will be important later.
--->
-
-To measure the number of dead tuples, connect to psql and run the following command.
-```
-SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
-```
-Which should give output similar to
-```
- n_live_tup | n_dead_tup |   relname
-------------+------------+--------------
-      10000 |      14149 | balances
-    1000000 |          0 | transactions
-      10000 |          0 | accounts
-```
-The following things should make sense to you:
-1. The number of live tuples in the `balances` and `accounts` tables is each 10000,
-    which is the number of accounts that we inserted with the `create_accounts.py` command.
-    (We INSERT one row into `balances` for each INSERT into `account`.)
-1. The `transactions` table has 1e6 rows because that's the number of transactions that we inserted.
-1. The `transactions` and `accounts` tables each have 0 dead tuples, because we have never called a DELETE or UPDATE on these tables.
-
-But the number of dead tuples in `balances` should look weird to you.
-That's because:
-1. We call two UPDATEs on `balances` for every insert into `transactions`.
-1. For every UPDATE, we create 1 dead tuple according to the procedure outlined at <http://www.interdb.jp/pg/pgsql05/03.html#533-update>.
-1. Therefore we should have 2e6 dead tuples, but we have a number much smaller.
-    (I got 14149, but your number is likely to be different.)
-
-Why is that?
-
-The answer is an optimization postgres implements called a *heap only tuple* (HOT) tuple.
-For our purposes right now, there are two important things to know about the HOT tuple optimization:
-1. It performs a "mini vacuum" that deletes all dead tuples in a page after an UPDATE operation finishes.
-    This mini vacuum is what is deleting most of the dead tuples we "should" be observing.
-    The `pg_stat_user_tables` relation that we examined above also has a column `n_tup_hot_upd` that records how many times the HOT tuple optimization triggered,
-    and if you run the following command:
-    ```
-    SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables;
-    ```
-    you should see that it triggered a lot.
-1. The HOT tuple optimization is only available on columns that do not have indexes.
-    In the next section, you will rerun these commands after creating an index and observe how the index can hurt UPDATE performance by removing the HOT optimization.
-
-> **Note:**
-> HOT tuples are described in detail in [Chapter 7 of our textbook](http://www.interdb.jp/pg/pgsql07.html).
-> For the final exam, you are responsible for understanding how HOT tuples work in detail, but we will not be going over them in lecture.
-
-<!--
-```
-postgres=# CREATE EXTENSION pgstattuple;
-CREATE EXTENSION
-postgres=# \x
-postgres=# SELECT * FROM pgstattuple('transactions');
--[ RECORD 1 ]------+---------
-table_len          | 52682752
-tuple_count        | 1000000
-tuple_len          | 41000000
-tuple_percent      | 77.82
-dead_tuple_count   | 0
-dead_tuple_len     | 0
-dead_tuple_percent | 0
-free_space         | 388388
-free_percent       | 0.74
-postgres=# SELECT * FROM pgstattuple('accounts');
--[ RECORD 1 ]------+-------
-table_len          | 524288
-tuple_count        | 10000
-tuple_len          | 460000
-tuple_percent      | 87.74
-dead_tuple_count   | 0
-dead_tuple_len     | 0
-dead_tuple_percent | 0
-free_space         | 2496
-free_percent       | 0.48
-postgres=# SELECT * FROM pgstattuple('balances');
--[ RECORD 1 ]------+--------
-table_len          | 1253376
-tuple_count        | 10000
-tuple_len          | 334804
-tuple_percent      | 26.71
-dead_tuple_count   | 3927
-dead_tuple_len     | 131463
-dead_tuple_percent | 10.49
-free_space         | 531044
-free_percent       | 42.37
-```
-See: <https://stackoverflow.com/questions/51156552/are-dead-rows-removed-by-anything-else-than-vacuum>
--->
-
-Let's remove the (relative few) dead tuples using the VACUUM command:
-```
-postgres=# VACUUM balances;
-```
-And then observe that there are now no dead tuples.
-```
-postgres=# SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
-```
-Which should give output similar to
-```
- n_live_tup | n_dead_tup |   relname
-------------+------------+--------------
-      10000 |          0 | balances
-    1000000 |          0 | transactions
-      10000 |          0 | accounts
+$ docker-compose exec -T pg psql -c "COPY accounts(name, description) FROM stdin DELIMITER E'\t' CSV HEADER" < data/accounts.tsv
 ```
 
-<!--
-```
-$ ls -l base/13481/16415*
--rw------- 1 postgres postgres 1253376 Apr  4 22:52 base/13481/16415
--rw------- 1 postgres postgres   24576 Apr  4 22:52 base/13481/16415_fsm
--rw------- 1 postgres postgres    8192 Apr  4 22:52 base/13481/16415_vm
-```
+## Exploring the default index
 
-```
-postgres=# SELECT pg_relation_filepath('balances');
- pg_relation_filepath 
-----------------------
- base/13481/16415
-(1 row)
-
-postgres=# VACUUM FULL balances;
-VACUUM
-
-postgres=# SELECT * FROM pgstattuple('balances');
--[ RECORD 1 ]------+-------
-table_len          | 450560
-tuple_count        | 10000
-tuple_len          | 334804
-tuple_percent      | 74.31
-dead_tuple_count   | 0
-dead_tuple_len     | 0
-dead_tuple_percent | 0
-free_space         | 9020
-free_percent       | 2
-
-postgres=# SELECT pg_relation_filepath('balances');
- pg_relation_filepath 
-----------------------
- base/13481/16435
-(1 row)
-
-```
-
-```
-$ ls -l base/13481/16415*
-ls: cannot access 'base/13481/16415*': No such file or directory
-$ ls -l base/13481/16435*
--rw------- 1 postgres postgres 450560 Apr  4 22:56 base/13481/16435
-```
-
-Talk about durability here.
--->
-
-## Observing `accounts` with an index
-
-We will now repeat the steps above on a table that has an index,
-and see how that index drastically changes performance.
-
-First restart postgres.
-```
-$ docker-compose down
-$ docker-compose up -d
-```
-Then enter psql and create an index on `balances(balance)`.
+Connect to psql with the command
 ```
 $ docker-compose exec pg psql
-postgres=# CREATE INDEX ON balances(balance);
-CREATE INDEX
 ```
-Now, all of our steps will be the same as above.
-Add the data.
+and run the psql command
 ```
-$ time python3 scripts/create_accounts.py --num_accounts=10000 postgresql://postgres:pass@localhost:9999
-$ time sh scripts/lots_of_data.sh postgresql://postgres:pass@localhost:9999
+\d+ accounts
 ```
+This will show you the schema of the accounts table.
+Notice that a new TEXT column `description` has been added to the table,
+and an index named `accounts_pkey` was created automatically by the PRIMARY KEY.
+
+The command
+```
+SELECT * FROM accounts WHERE account_id=13000;
+```
+will select all of the information about the account with `account_id=13000`.
+The *query plan* is the imperative algorithm that postgres will use to evaluate this query.
+You can find it by prepending the `EXPLAIN` command before the query like so:
+```
+EXPLAIN SELECT * FROM accounts WHERE account_id=13000;
+```
+Running the above command should give you output that looks something like
+```
+                                   QUERY PLAN
+--------------------------------------------------------------------------------
+ Index Scan using accounts_pkey on accounts  (cost=0.29..8.30 rows=1 width=281)
+   Index Cond: (account_id = 13000)
+(2 rows)
+```
+Observe that this query is using an index scan.
+It should make sense to you that an index scan is the best we can do for this query (because an index only scan is not possible and a bitmap scan or sequential scan will both have more overhead).
+
+Observe that the following query will use an index only scan (by computing the query plan with EXPLAIN).
+```
+SELECT account_id FROM accounts WHERE account_id=13000;
+```
+
+Observe that the following query plan will use an index scan.
+```
+SELECT * FROM accounts WHERE account_id>13000;
+```
+(It should make sense to you why a btree index allows inequality constraints.)
+
+Now observe that the following query will use a sequential scan.
+```
+SELECT * FROM accounts WHERE account_id<13000;
+```
+The query above could technically be done with an index scan,
+but postgres has determined that the overhead of an index scan is too great,
+and a sequential scan will actually be more efficient.
 
 <!--
-```
-postgres=# select max(balance) from balances;
-   max
-----------
- 29520.00
-(1 row)
-
-Time: 0.636 ms
-postgres=# explain (analyze, buffers) select max(balance) from balances;
-                                                                              QUERY PLAN
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Result  (cost=0.49..0.50 rows=1 width=32) (actual time=0.081..0.084 rows=1 loops=1)
-   Buffers: shared hit=4
-   InitPlan 1 (returns $0)
-     ->  Limit  (cost=0.43..0.49 rows=1 width=16) (actual time=0.072..0.074 rows=1 loops=1)
-           Buffers: shared hit=4
-           ->  Index Only Scan Backward using balances_balance_idx on balances  (cost=0.43..77028.09 rows=1176438 width=16) (actual time=0.070..0.070 rows=1 loops=1)
-                 Index Cond: (balance IS NOT NULL)
-                 Heap Fetches: 1
-                 Buffers: shared hit=4
- Planning Time: 0.187 ms
- Execution Time: 0.123 ms
-(11 rows)
-
-Time: 0.817 ms
-```
+We can verify that with the EXPLAIN(ANALYZE,BUFFERS) command.
+Recall that EXPLAIN only computes the query plan, but EXPLAIN(ANALYZE,BUFFERS) actually runs the query and reports debug statistics
 -->
 
-And check the sizes of the `balances` table.
-```
-$ ls -l base/13481/16415*
--rw------- 1 postgres postgres 57540608 Apr  4 23:15 base/13481/16415
--rw------- 1 postgres postgres    32768 Apr  4 23:15 base/13481/16415_fsm
-```
-(Again, due to the nondeterminism of the `lots_of_data.sh` script, your numbers may be slightly different.)
+## Indexing `names`
 
-Notice that the size of the `balances` table is about 50x bigger.
-(It's easy to lose track of the fact that we've added an extra order of magnitude.)
+We currently have no indexes that can speed up queries with a condition on the `name` column like the following.
+```
+SELECT * FROM accounts WHERE name='APEX INVESTMENTS';
+```
+Use the EXPLAIN command to observe that this query will use a sequential scan.
 
-Indexes have their own separate OIDs in postgres,
-and are stored in their own files.
-Therefore the 50x size explosion above doesn't measure the actual size of the index.
-To check its size, first find it's file location:
+Now run the following command.
 ```
-postgres=# SELECT pg_relation_filepath('balances_balance_idx');
- pg_relation_filepath
-----------------------
- base/13481/16425
+CREATE INDEX ON accounts(name);
 ```
-Then measure the size of that file
-```
-$ ls -l $PGDATA/base/13481/16425*
--rw------- 1 postgres postgres 59187200 Apr  4 23:17 base/13481/16425
-```
-That's 59MB.
-In total, creating this index caused a table that was previously taking only about 1MB of disk space to now take up 116MB (57 for the table itself, and 59 for the index).
-Disk space is cheap, and so for most problems a 100x explosion in filesize is not a problem.
-But for very large datasets, this could be disasterous.
+And observe that the SELECT query above will now use an index scan.
 
-Let's now observer why the filesize is so bloated.
-Rerun our command to measure the number of dead tuples:
-```
-postgres=# SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
- n_live_tup | n_dead_tup |   relname
-------------+------------+--------------
-      10000 |    2000000 | balances
-    1000000 |          0 | transactions
-      10000 |          0 | accounts
-```
-We are now getting the predicted 2e6 dead tuples in the `balances` table because the HOT tuple optimization cannot fire, and so no mini-vacuum ever cleans the table.
+There are many other types of queries that we might want to perform on the `names` column besides equality queries.
+For example, there are many accounts in this dataset whose name starts with the word APEX,
+and it would be interesting to select all of these accounts.
+There are many ways we can do that with SQL,
+and they will each require different indexes.
 
-Let's run the VACUUM manually.
-```
-postgres=# VACUUM balances;
-VACUUM
-```
-And now observe there are no dead tutples.
-```
-postgres=# SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
- n_live_tup | n_dead_tup |   relname
-------------+------------+--------------
-      10000 |          0 | balances
-    1000000 |          0 | transactions
-      10000 |          0 | accounts
-(3 rows)
-```
-Leave psql, and use the `ls -l` commands to measure the file size of the table and index.
-```
-$ ls -l base/13481/16415*
--rw------- 1 postgres postgres 57540608 Apr  5 04:41 base/13481/16415
--rw------- 1 postgres postgres    32768 Apr  5 04:33 base/13481/16415_fsm
--rw------- 1 postgres postgres     8192 Apr  5 04:41 base/13481/16415_vm
-$ ls -l base/13481/16425*
--rw------- 1 postgres postgres 59187200 Apr  5 04:41 base/13481/16425
-```
-Notice that the filesizes have not changed at all.
-Recall that VACUUMing never deletes pages, and so doesn't free up disk space.
-To actually free up disk space, we need to run
-```
-postgres=# VACUUM FULL balances;
-```
-Notice that this command actually changes where the tables are stored on the harddrive.
-If you try to measure the filesize using the old file paths
-```
-$ ls -l base/13481/16415*
-$ ls -l base/13481/16425*
-```
-you will get errors about the file not existing.
+### Method 1
 
-You should first find the new paths to the files
+Perhaps the most obvious method of extracting accounts whose name begins with `APEX` is to use the LIKE operator:
 ```
-postgres=# SELECT pg_relation_filepath('balances');
- pg_relation_filepath
-----------------------
- base/13481/16426
-(1 row
-postgres=# SELECT pg_relation_filepath('balances_balance_idx');
- pg_relation_filepath
-----------------------
- base/13481/16430
-(1 row)
+SELECT * FROM accounts WHERE name LIKE 'APEX%';
 ```
-Then measure the size of those paths
-```
-root@7e1014af3511:/var/lib/postgresql/data# ls -l base/13481/16426*
--rw------- 1 postgres postgres 450560 Apr  5 04:43 base/13481/16426
-root@7e1014af3511:/var/lib/postgresql/data# ls -l base/13481/16430*
--rw------- 1 postgres postgres 245760 Apr  5 04:43 base/13481/16430
-```
-After performing the VACUUM FULL, we've reduced the filesize from over 100MB to under 1MB!
+Unfortunately, if you EXPLAIN this query, you will see that your current index is not being used.
+[Page 2 of the habr.com blog posts](https://habr.com/en/companies/postgrespro/articles/442546/) explains how different operator classes can be used to provide different functionality for indexes.
+By default, the btree index only supports the <, <=, =, >, and >= operators, and does not support the LIKE operator.
 
-The disadvantage of a VACUUM FULL is that it acquires an EXCLUSIVE LOCK on the table,
-and so nothing can run concurrently.
+We can create a btree index that supports the LIKE operator by defining an index that uses the `text_pattern_ops` operator class like so:
+```
+CREATE INDEX ON accounts(name text_pattern_ops);
+```
+Now, if you re-EXPLAIN the SELECT query above, you should see it using the index.
 
-### Measuring the benefit of the index
+### Method 2
 
-If the index causes so much table bloat,
-why do we want it?
+Another reasonable method of extracting accounts whose name begins with `APEX` is to split the name into words, and check that the first word is equal to `APEX`.
+In postgres, the built-in `split_part` function can be used to extract words from text.
+The following SQL query follows this strategy.
+```
+SELECT * FROM accounts WHERE split_part(name, ' ', 1)='APEX';
+```
+Unfortunately, this query cannot use either of our indexes created so far.
 
-Let's say we need to find the largest account balance.
-We can answer that question with a query that looks like
+In order for postgres to use an index, any function calls that are applied to the columns must also be contained in the index.
+For example, id you create the following index
 ```
-SELECT max(balance) FROM balances;
+CREATE INDEX ON accounts(split_part(name, ' ', 1));
 ```
-Without an index, this would require a full sequential scan of the table.
-Previously, we saw that the table without an index used 149 pages of disk space,
-and so we would have to read all of those pages.
-As more information gets added to the table, this number would grow linearly.
+then the SELECT query above will be able to use the index.
 
-With an index, however, we will use significantly fewer page accesses.
+### Method 3
 
-In class, we saw how to use the EXPLAIN command to compute the *query plan*.
-This is the imperative algorithm that postgres will use to actually compute the query's results. 
-There are many variations of the EXPLAIN command,
-but one useful variation is `EXPLAIN(analyze,buffers)`.
-In this variation, postgres will actually run the command, and report runtimes of each substep and the total number of pages accessed.
-Run the following example in psql to measure the performance of our SELECT query above.
+Perhaps the least obvious way of finding words that start with `APEX` is to rely on the >= and < operators.
+The following query takes advantage of the ASCIIbetical ordering of the letters to find all companies that start with `APEX`.
 ```
-postgres=# EXPLAIN(analyze, buffers) SELECT max(balance) FROM balances;
-                                                                           QUERY PLAN
------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Result  (cost=0.34..0.35 rows=1 width=32) (actual time=0.051..0.053 rows=1 loops=1)
-   Buffers: shared hit=3
-   InitPlan 1 (returns $0)
-     ->  Limit  (cost=0.29..0.34 rows=1 width=16) (actual time=0.044..0.045 rows=1 loops=1)
-           Buffers: shared hit=3
-           ->  Index Only Scan Backward using balances_balance_idx on balances  (cost=0.29..514.41 rows=9950 width=16) (actual time=0.041..0.042 rows=1 loops=1)
-                 Index Cond: (balance IS NOT NULL)
-                 Heap Fetches: 1
-                 Buffers: shared hit=3
- Planning Time: 0.176 ms
- Execution Time: 0.092 ms
-(11 rows)
+SELECT * FROM accounts WHERE name >= 'APEX' AND name < 'APEY';
 ```
-The most import line in the above output is line 2, which reads
-```
-   Buffers: shared hit=3
-```
-Here, "Buffers" is a synonym for "blocks" or "pages",
-and so we were able to answer the `max` query by accessing only 3 pages instead of the full 149.
+Observe that this query does not need a new index.
+The default btree index we created at the beginning works well in this case. 
 
-This number grows only logarithmically, and so will always be very small.
-I've personally never seen a btree index query access more than 5 pages,
-even on tables that occupy terabytes (and so have billions of pages).
-
-## Autovacuum
-
-So far we've seen:
-1. Indexes are important for speeding up SELECT queries.
-1. But indexes disable the HOT tuple optimization.
-1. This can cause our table to have too many dead tuples.
-1. Dead tuples lead to wasted disk space (and lots of other problems).
-The autovacuum will help us minimize these drawbacks of indexes.
-
-Examine the contents of the schema.
-```
-$ cat services/pg/sql/ledger-pg.sql
-```
-Notice that each of the CREATE TABLE commands is terminated with a clause that looks like
-```
-WITH (autovacuum_enabled = off)
-```
-So all of the databases you've previously been working with had the autovacuum tool disabled.
-(By default, it is enabled for every table.)
-
-Re-enable the autovacuum command by deleting these clauses from each CREATE TABLE command.
-Then bring the database down, rebuild the database, and bring it back up.
-It is important to remember to run the `docker-compose build` command---which you don't normally have to run---because you've changed the schema files.
-If you don't rerun this command, then autovacuum will not be enabled on your new database.
-
-Now create an index in this new database
-```
-$ docker-compose exec pg psql
-postgres=# CREATE INDEX ON balances(balance);
-CREATE INDEX
-```
-And add the data.
-```
-$ time python3 scripts/create_accounts.py --num_accounts=10000 postgresql://postgres:pass@localhost:9999
-$ time sh scripts/lots_of_data.sh postgresql://postgres:pass@localhost:9999
-```
-Once the data is loaded, observe that there are now no dead tuples in your table.
-```
-postgres=# SELECT n_live_tup, n_dead_tup, relname FROM pg_stat_user_tables;
- n_live_tup | n_dead_tup |   relname
-------------+------------+--------------
-      10000 |          0 | balances
-    1000000 |          0 | transactions
-      10000 |          0 | accounts
-```
-The HOT optimization is not firing (and performing the corresponding mini vacuums).
-But there are no dead tuples in your table.
-That's because autovacuum automatically calls the VACUUM command when the table becomes too bloated.
-Because the VACUUM command acquires only a SHARE UPDATE EXCLUSIVE lock,
-it will not conflict with any concurrent SELECT/UPDATE/INSERT/DELETE commands.
-
-For small datasets (say <1TB), the default settings of autovacuum generally work well.
-For large datasets, autovacuum has many parameters that should be tuned for optimal performance.
-A large company that uses postgres (like Instagram) would have multiple employees whose job is basically just tuning autovacuum.
-
-<img src=img/autovacuum.jpg width=300px >
-
-<!--
-```
-root@294274f36cc2:/# cd $PGDATA
-root@294274f36cc2:/var/lib/postgresql/data# ls -l base/13481/16415*
--rw------- 1 postgres postgres 30015488 Apr  5 05:35 base/13481/16415
--rw------- 1 postgres postgres    24576 Apr  5 05:34 base/13481/16415_fsm
--rw------- 1 postgres postgres     8192 Apr  5 05:34 base/13481/16415_vm
-root@294274f36cc2:/var/lib/postgresql/data# ls -l base/13481/16425*
--rw------- 1 postgres postgres 33226752 Apr  5 05:36 base/13481/16425
--rw------- 1 postgres postgres    24576 Apr  5 05:34 base/13481/16425_fsm
-```
--->
+The takeaway from this is that you must be very careful when writing your SQL SELECT queries to ensure that they are compatible with the indexes you have available.
 
 ## Submission
 
-This material is not normally taught in college CS classes because it is difficult to design problem sets that will assess a student's understanding.
-Nevertheless, it is important material that is required for understanding real-world large scale systems.
-Therefore, we're covering the material in class, and you're responsible for this material in the final exam, but there's no "real" submission.
-To submit the lab, just write 1 short paragraph into sakai about what you learned.
+There are 348 accounts whose `name` column ends in the word `Management` (case insensitive).
+Write a SELECT query that lists these account names.
+(You know it's correct if you get the right number.)
+Then create an index that will allow your SELECT query to use any of the non-sequential scans (i.e. index scan, index only scan, or bitmap scan).
+
+Submit your SELECT query and CREATE INDEX commands to sakai.
+
+## Final Exam Prep
+
+There is nothing to submit for this section, but it will review an important concept for the final exam.
+
+Consider the following query
+```
+SELECT * FROM accounts where name LIKE 'APEX%' OR account_id > 13000;
+```
+If you use EXPLAIN to get the query plan, you should see something like
+```
+                                    QUERY PLAN
+----------------------------------------------------------------------------------
+ Bitmap Heap Scan on accounts
+   Recheck Cond: ((name ~~ 'APEX%'::text) OR (account_id > 13000))
+   Filter: ((name ~~ 'APEX%'::text) OR (account_id > 13000))
+   ->  BitmapOr
+         ->  Bitmap Index Scan on accounts_name_idx
+               Index Cond: ((name ~>=~ 'APEX'::text) AND (name ~<~ 'APEY'::text))
+         ->  Bitmap Index Scan on accounts_pkey
+               Index Cond: (account_id > 13000)
+(8 rows)
+```
+Notice that the above query plan uses two indexes:
+1. `accounts_name_idx`, created on `accounts(name)` and
+1. `accounts_pkey`, created on `accounts(account_id)`.
+The names of your indexes may be different (due to you having created different indexes while experimenting with the submission problem), but you should still have two indexes listed.
+
+There is no single index that will work for this query to enable an efficient index scan or an index only scan, and the bitmap scan is the best we can do.
+You can partially verify this claim by running the following two commands
+```
+CREATE INDEX ON accounts(name text_pattern_ops, account_id);
+CREATE INDEX ON accounts(account_id, name text_pattern_ops);
+```
+and observing that the SELECT query above will continue to use the bitmap scan.
+
+Before the final exam, you should ensure you understand why the query above can be efficiently implemented with a bitmap scan, but cannot be implemented with an index or index only scan.

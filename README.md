@@ -5,7 +5,7 @@ In this lab, you will:
 1. learn more edge cases about when indexes can speed up queries, and
 1. get practice using the EXPLAIN command to debug performance problems.
 
-<img src=img/explain-analyze.jpg width=300px />
+<img src=img/explain_analyze.jpg width=250px />
 
 ## Problem Setup
 
